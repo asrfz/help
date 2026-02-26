@@ -39,26 +39,26 @@ from boltz.data.types import Manifest, Record
 from boltz.data.write.writer import BoltzAffinityWriter, BoltzWriter
 from boltz.model.models.boltz2 import Boltz2
 
-
 # -------------------------
 # PATHS (Narval)
 # -------------------------
-SCRATCH = Path(os.environ.get("SCRATCH", "/scratch/asarrafz")).resolve()
-
-PROJECT_DIR = SCRATCH / "boltz_project"
+PROJECT_DIR = Path("/home/aiden/boltz_project/")
 IN_CSV = PROJECT_DIR / "binding_data_kd.csv"
 
 MSA_DIR = PROJECT_DIR / "msas"
 MSA_MASTER_FASTA = PROJECT_DIR / "all_proteins_for_msa.fasta"
 
-CACHE_DIR = Path(os.environ.get("BOLTZ_CACHE", str(SCRATCH / "boltz_cache"))).expanduser().resolve()
+CACHE_DIR = Path(os.environ.get("BOLTZ_CACHE", str("~/.boltz"))).expanduser().resolve()
 CONF_CKPT = CACHE_DIR / "boltz2_conf.ckpt"
 AFF_CKPT  = CACHE_DIR / "boltz2_aff.ckpt"
 MOL_DIR   = CACHE_DIR / "mols"
 
 # if running under Slurm, we put outputs in /scratch/asarrafz/run_setB/affinity_run_<jobid>
 JOBID = os.environ.get("SLURM_JOB_ID", "interactive")
-WORKDIR = SCRATCH / "run_setB" / f"affinity_run_{JOBID}"
+WORKDIR = PROJECT_DIR / "boltz_results_yamls"
+WORKDIR.mkdir(parents=True, exist_ok=True)
+WORKDIR = WORKDIR / f"affinity_run_{JOBID}"
+WORKDIR.mkdir(parents=True, exist_ok=True)
 
 # -------------------------
 # RUNTIME SETTINGS
@@ -152,8 +152,8 @@ def file_info(p: Path) -> str:
             n = len(list(p.iterdir()))
             return f"{p} (dir, {n} entries)"
         return f"{p} (file, {p.stat().st_size} bytes)"
-    except Exception as e:
-        return f"{p} (exists? error: {e})"
+    except FileNotFoundError as e:
+        return f"{e}"
 
 
 # -------------------------
@@ -238,6 +238,8 @@ def process_csv_to_processed(
     else:
         dbg("row_id column already present.")
 
+    
+
     # quick NA / basic stats
     dbg(f"NA counts: protein={int(df['protein_sequence'].isna().sum())}, peptide={int(df['peptide_sequence'].isna().sum())}, kd={int(df['kd_value'].isna().sum())}")
     dbg(f"Unique proteins={df['protein_sequence'].nunique(dropna=True)} | Unique peptides={df['peptide_sequence'].nunique(dropna=True)}")
@@ -280,7 +282,6 @@ def process_csv_to_processed(
     dbg(f"Loaded master FASTA seqs: {len(seq_to_idx)}")
     sanity(len(seq_to_idx) > 0, "MSA master FASTA index is empty.")
 
-    # output dirs
     processed_dir = out_dir / "processed"
     structure_dir = processed_dir / "structures"
     processed_msa_dir = processed_dir / "msa"
@@ -290,6 +291,7 @@ def process_csv_to_processed(
     records_dir = processed_dir / "records"
     predictions_dir = out_dir / "predictions"
 
+    # NOTE: constuct ourput processed/predction directories 
     for d in [structure_dir, processed_msa_dir, processed_mols_dir,
               processed_constraints_dir, processed_templates_dir,
               records_dir, predictions_dir]:
@@ -316,10 +318,12 @@ def process_csv_to_processed(
         rid = int(row.row_id)
         prot = norm_seq(row.protein_sequence)
         smi = row.ligand_smiles
-
+        
+        # NOTE: if the protein or ligand is missing, we skip it
         if not prot or prot == "NAN" or smi is None or str(smi).lower() == "nan":
             n_skip_empty += 1
             continue
+
 
         # resolve MSA path using master fasta index
         msa_path_str: Optional[str] = None
@@ -349,12 +353,16 @@ def process_csv_to_processed(
         }
         name = f"row_{rid}"
 
+        # NOTE: parse the boltz schema
         try:
             target = parse_boltz_schema(name, schema, ccd, mol_dir, boltz_2=True)
         except Exception as e:
             n_parse_fail += 1
             if n_parse_fail <= 5:
                 dbg(f"SKIP {name}: parse error — {e}")
+                # Drop row from dataframe
+                df = df.drop(index=rid)
+                dbg(f"Dropped row {rid} from dataframe. New dataframe shape: {df.shape}")
             continue
 
         # normalize msa_id: never allow "empty"/None strings to survive
@@ -371,12 +379,16 @@ def process_csv_to_processed(
             if isinstance(c.msa_id, str) and c.msa_id.endswith((".a3m", ".csv"))
         })
 
+        # NOTE: we iterate over the unique MSAs and dump them to the processed/msa/ directory
         for msa_i, raw_msa_id in enumerate(msas_unique):
             raw_msa_path = Path(raw_msa_id)
             processed_name = f"{target_id}_{msa_i}"
             processed_path = processed_msa_dir / f"{processed_name}.npz"
             msa_id_map[raw_msa_id] = processed_name
 
+            # NOTE: if the MSA file does not exist, we skip it
+            # given there exist a processed raw msa file we load it 
+            # and dump it to the processed/msa/ directory
             if not processed_path.exists() and raw_msa_path.exists():
                 if raw_msa_path.suffix == ".a3m":
                     msa_obj = parse_a3m(raw_msa_path, taxonomy=None, max_seqs=max_msa_seqs)
@@ -392,12 +404,13 @@ def process_csv_to_processed(
             elif chain.msa_id in ("empty", "", None, 0):
                 chain.msa_id = -1
 
-        # dump templates/constraints/extra_mols/structure/record
+        # NOTE: templates are dumped into the processed/templates/ directory
         for template_id, template_struct in target.templates.items():
             tpl_path = processed_templates_dir / f"{target_id}_{template_id}.npz"
             if not tpl_path.exists():
                 template_struct.dump(tpl_path)
 
+        # 
         con_path = processed_constraints_dir / f"{target_id}.npz"
         if not con_path.exists():
             target.residue_constraints.dump(con_path)
@@ -467,7 +480,7 @@ def run_structure_prediction(manifest: Manifest, out_dir: Path, mol_dir: Path, c
         str(conf_ckpt),
         strict=True,
         predict_args=predict_args,
-        map_location="cpu",
+        map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         diffusion_process_args=asdict(Boltz2DiffusionParams()),
         ema=False,
         pairformer_args=asdict(PairformerArgsV2()),
@@ -518,15 +531,38 @@ def run_structure_prediction(manifest: Manifest, out_dir: Path, mol_dir: Path, c
 # Step 3: affinity prediction
 # -------------------------
 def run_affinity_prediction(manifest: Manifest, out_dir: Path, mol_dir: Path, aff_ckpt: Path) -> None:
+    processed_dir = out_dir / "processed"
+    predictions_dir = out_dir / "predictions"
+
+    # Filter to records that actually have a pre_affinity structure file.
+    # This prevents the DataLoader from crashing on missing files such as
+    # .../predictions/row_13/pre_affinity_row_13.npz and simply skips them.
     affinity_records = [r for r in manifest.records if r.affinity is not None]
-    dbg(f"Affinity records in manifest: {len(affinity_records)}/{len(manifest.records)}")
+    dbg(f"Affinity records in manifest (before file check): {len(affinity_records)}/{len(manifest.records)}")
     if not affinity_records:
         dbg("No affinity records found in manifest. Skipping affinity step.")
         return
 
-    affinity_manifest = Manifest(affinity_records)
-    processed_dir = out_dir / "processed"
-    predictions_dir = out_dir / "predictions"
+    available_records: list[Record] = []
+    missing_paths: list[str] = []
+    for r in affinity_records:
+        pre_affinity_path = predictions_dir / r.id / f"pre_affinity_{r.id}.npz"
+        if pre_affinity_path.exists():
+            available_records.append(r)
+        else:
+            missing_paths.append(str(pre_affinity_path))
+
+    if missing_paths:
+        dbg(f"Skipping {len(missing_paths)} affinity records without pre_affinity npz.")
+        # Print only a few paths to keep logs readable.
+        for p in missing_paths[:10]:
+            dbg(f"  missing pre_affinity file: {p}")
+
+    if not available_records:
+        dbg("No affinity records have pre_affinity structures on disk. Skipping affinity step.")
+        return
+
+    affinity_manifest = Manifest(available_records)
 
     dbg("Sanity before affinity prediction:")
     dbg(f"  aff_ckpt: {file_info(aff_ckpt)}")
@@ -556,7 +592,7 @@ def run_affinity_prediction(manifest: Manifest, out_dir: Path, mol_dir: Path, af
         str(aff_ckpt),
         strict=True,
         predict_args=predict_args,
-        map_location="cpu",
+        map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         diffusion_process_args=asdict(Boltz2DiffusionParams()),
         ema=False,
         pairformer_args=asdict(PairformerArgsV2()),
@@ -689,10 +725,10 @@ def main():
     torch.set_grad_enabled(False)
     torch.set_float32_matmul_precision("highest")
 
+
     dbg("=== BOOT ===")
     dbg(f"Python: {sys.version.split()[0]}")
     dbg(f"Torch: {torch.__version__} | cuda_available={torch.cuda.is_available()} | accelerator={ACCELERATOR}")
-    dbg(f"SCRATCH: {SCRATCH}")
     dbg(f"JOBID: {JOBID}")
     dbg(f"WORKDIR (planned): {WORKDIR}")
 
@@ -702,6 +738,7 @@ def main():
     for key in ["CUEQ_DEFAULT_CONFIG", "CUEQ_DISABLE_AOT_TUNING"]:
         os.environ[key] = os.environ.get(key, "1")
 
+    # NOTE: check if all of these paths exist.
     dbg("=== PATH SANITY ===")
     dbg(file_info(PROJECT_DIR))
     dbg(file_info(IN_CSV))
@@ -724,11 +761,7 @@ def main():
     dbg("=== WORKDIR CREATE + WRITE TEST ===")
     WORKDIR.mkdir(parents=True, exist_ok=True)
     sanity(WORKDIR.exists(), "WORKDIR not created")
-    # write test file to confirm permissions
-    test_path = WORKDIR / "_write_test.txt"
-    test_path.write_text("ok\n")
-    sanity(test_path.exists(), "Cannot write in WORKDIR")
-    dbg(f"WORKDIR ready + writable: {WORKDIR}")
+
 
     print("\n=== STEP 1: CSV -> processed/manifest ===", flush=True)
     df, manifest = process_csv_to_processed(
@@ -742,10 +775,10 @@ def main():
     if not manifest.records:
         raise RuntimeError("No records created. Check CSV columns and sequences.")
     dbg(f"Manifest records: {len(manifest.records)}")
-
+    """
     print("\n=== STEP 2: Structure prediction ===", flush=True)
     run_structure_prediction(manifest, WORKDIR, MOL_DIR, CONF_CKPT)
-
+    """
     print("\n=== STEP 3: Affinity prediction ===", flush=True)
     run_affinity_prediction(manifest, WORKDIR, MOL_DIR, AFF_CKPT)
 
